@@ -1,0 +1,123 @@
+S4 — SWEEP: is ZCode / CodeGeeX correctly wired across the three agent-registration
+        surfaces (dsl_mode flag-gate map, native detector registry, daemon e2e fixtures)?
+
+PR:            https://github.com/onyxsecurity/onyx/pull/13395
+BRANCH:        factory-eval-/PRDCT-14237
+HEAD (cited):  06e3abf098f72f9ba02778d8d70784ed7f013896
+Captured:      2026-09-22 (UTC), engineer round 17
+
+Board rule (verbatim): "S4 - sweep rows for dsl_mode.go's flag-gated agent map,
+interface.go's native detector registry, and the daemon e2e per-agent test_env fixtures."
+
+VERDICT: all three surfaces are CORRECT as-shipped. ZCode/CodeGeeX are DSL-discovery-only
+agents (discovered from the committed embedded DSL envelope + dynamic detector), so they
+must be ABSENT from the two native-implementation surfaces (S4a, S4b) and need NO daemon
+install-lane fixture (S4c). Each leg is confirmed below against the code at the cited HEAD.
+
+================================================================================
+S4a — dsl_mode.go flag-gated agent map: ZCode/CodeGeeX correctly ABSENT
+================================================================================
+File: scanner/internal/scanner/agents/dsl_mode.go
+
+  27  // flagGatedAgents are the agents whose implementation ONYX_SCANNER_DSL_ENABLED
+  29  var flagGatedAgents = map[string]bool{
+  30      "claude-code": true,
+  31      "codex":       true,
+  ...
+
+  $ grep -cin 'zcode\|codegeex' scanner/internal/scanner/agents/dsl_mode.go
+  0                       <-- ZCode/CodeGeeX are NOT flag-gated
+
+WHY THIS IS CORRECT: `flagGatedAgents` is the set whose implementation the
+ONYX_SCANNER_DSL_ENABLED flag MOVES between the native detector and the DSL shadow —
+exactly one pair (claude-code, codex). It is NOT "the list of DSL agents". ZCode/CodeGeeX
+ship as always-on DSL agents; putting them in flagGatedAgents would (a) drop their DSL
+detector whenever the flag is OFF (SelectDSLDetectorsForMode filters flag-gated names,
+dsl_mode.go:159-168), making the runtime vanish, and (b) is unnecessary because they have
+no competing native implementation to gate against. Absence here is the intended wiring.
+
+================================================================================
+S4b — interface.go native detector registry: ZCode/CodeGeeX correctly have NO
+       native DISCOVERY detector (DSL-envelope discovery only)
+================================================================================
+File: scanner/internal/scanner/agents/interface.go (CreateAgentRegistryWithFs)
+
+  Unconditional shadow-LESS native discovery detectors (both modes), interface.go:357-374:
+     NewLMStudioDetector(...)     (357-367)  -- native, no DSL shadow
+     NewAnythingLLMDetector(...)  (368)      -- native, no DSL shadow
+     NewQoderDetector(...)        (374)      -- native, no DSL shadow
+  Flag-gated natives (claude-code, codex) appended only `if !DSLDetectorsEnabled()`.
+
+  $ grep -rn 'NewZcodeDetector\|NewCodegeexDetector\|NewZCodeDetector\|NewCodeGeeXDetector' \
+        scanner/internal/scanner/agents/
+  NONE                    <-- no native discovery detector constructor for zcode/codegeex
+
+WHY THIS IS CORRECT: ZCode/CodeGeeX discovery is served entirely by the committed embedded
+DSL envelope + dynamic detector — there is no hand-written Go discovery detector to
+register. A native detector here would be a SECOND implementation and would duplicate the
+envelope's discovery.
+
+  NOT to be confused with the RUNTIME HOOKS lane:
+  $ grep -rn 'NewZcodeHooksHandler' scanner/  (non-test)
+     scanner/internal/scanner/agents/zcode_hooks.go:76   func NewZcodeHooksHandler() ...
+     scanner/cmd/hooks.go                                 (wires the hooks CLI lane)
+  `NewZcodeHooksHandler` is the ZCode runtime hook BLOCK-ENFORCEMENT handler (the lane the
+  live C7 proof exercises: `hooks --source=zcode --type=tool`). It is wired into the hooks
+  CLI (scanner/cmd/hooks.go), NOT into the interface.go discovery registry — a distinct
+  concern from discovery. Its presence is correct; its ABSENCE from the discovery registry
+  is also correct.
+
+================================================================================
+S4c — daemon e2e per-agent test_env fixtures: ZCode/CodeGeeX correctly need NONE
+================================================================================
+Dir: daemon/e2e/test_env/agents/
+
+  Fixture classes present (the full set):
+     claude_code.py   -> ClaudeCode(CodingAgent)
+     claude_desktop.py-> ClaudeDesktop(CodingAgent)
+     codex.py         -> Codex(CliAgent)
+     openclaw.py      -> OpenClaw(CliAgent)
+     opencode.py      -> OpenCode(CliAgent)
+     (+ base.py, _cli_agent.py, fixtures.py, login/  = shared machinery)
+
+  $ grep -rlin 'zcode\|codegeex' daemon/
+  NONE — zcode/codegeex absent from all of daemon/
+
+WHY THIS IS CORRECT — the fixture set is a CURATED INSTALL-LANE SUBSET, not an exhaustive
+mirror of the scanner's detectable-agent registry:
+  * These fixtures model agents with a real VM install/login/invoke/hooks lane the daemon
+    e2e DRIVES end-to-end (npm_package, version_command, login_spec, hooks_installed(),
+    config_model(); see codex.py). fixtures.py writes MCP/skill entries into each agent's
+    OWN config so DSL-detection assertions have something distinctive to find.
+  * Many agents the scanner DOES detect have NO daemon fixture either — proving the set is
+    representative, not complete:
+       Kiro       (scanner/internal/scanner/agents/kiro_test.go)
+       Cline      (embedded_dsl_cline_test.go)
+       LMStudio   (lm_studio.go)          AnythingLLM (anythingllm.go)   Qoder (native)
+    None of these five has a daemon/e2e fixture, yet all are scanner-detected.
+  * No completeness contract exists: daemon/e2e/tests/unit/test_agents.py imports exactly
+    the five classes above and tests each with its OWN explicit functions — there is NO
+    "all detectable agents" parametrize / registry-completeness assertion that a new agent
+    is required to join. (conftest.py enumerates only the machine matrix, not agents.)
+
+  ZCode/CodeGeeX are DSL-DISCOVERY-ONLY agents with no daemon install-lane in this PR's
+  scope. A daemon fixture would additionally require the Zhipu ZCode / CodeGeeX CLIs to be
+  installable on the CI cloud-VM matrix (aws:linux:amd64 default) — out of scope here. Their
+  REAL install + scan is proven on the provisioned lab host instead (rows S1 / C1 / C2:
+  ZCode 3.11.2 + CodeGeeX 2.27.6 installed, scanned, byte-faithful payload -> DB row), and
+  the runtime hooks lane is proven live (C7: real /guard/evaluate/zcode request).
+
+================================================================================
+Cross-check — ZCode/CodeGeeX ARE present where they SHOULD be (embedded DSL envelopes)
+================================================================================
+  $ grep -c 'zcode' | grep -c 'codegeex'  (per committed envelope)
+     embedded_dsl_linux.json    zcode=10  codegeex=29
+     embedded_dsl_darwin.json   zcode=10  codegeex=29
+     embedded_dsl_windows.json  zcode=10  codegeex=29
+  Present in all three OS envelopes — the single source of ZCode/CodeGeeX discovery, CI-gated
+  by `python3 tools/dsl_agents/build.py --check`.
+
+SUMMARY: S4a absent (correct), S4b absent from discovery registry (correct; hooks handler
+present & correctly placed), S4c no fixture (correct — curated subset, no completeness
+contract), and present in all 3 DSL envelopes (correct). No code change is warranted on any
+of the three sweep surfaces; the wiring is deliberate and internally consistent.
